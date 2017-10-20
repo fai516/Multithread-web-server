@@ -1,17 +1,4 @@
-/************************************************************************/
-/*   PROMGRAMMER NAMES: Jerry Linder and the Google search engine		*/	
-/*   PROGRAM NAME: client.cpp  (works with server.cpp)                  */
-/*	 ASSIGNMENT: C3800 Operating Systems Project 3 (Inst: Fikret Ercal) */
-/*                                                                      */
-/*   Server creates a socket to listen for the connection from Client   */
-/*   Client asks for a display name which then gets read by the Server. */
-/*   When the communication established, Server echoes data from Client */
-/*   and writes them back.                                              */
-/*                                                                      */
-/*   COMPILE:         g++ client.cpp -pthread -o client    		        */
-/*	 TO RUN:		  ./client											*/
-/*                                                                      */
-/************************************************************************/
+
 #include <iostream>
 #include <string>
 #include <sys/socket.h>  /* define socket */
