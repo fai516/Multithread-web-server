@@ -1,246 +1,96 @@
 
+//
+// server.cpp
+// ~~~~~~~~~~
+//
+// Copyright (c) 2003-2017 Christopher M. Kohlhoff (chris at kohlhoff dot com)
+//
+// Distributed under the Boost Software License, Version 1.0. (See accompanying
+// file LICENSE_1_0.txt or copy at <a href="http://www.boost.org/LICENSE_1_0.txt">http://www.boost.org/LICENSE_1_0.txt</a>)
+//
 
-#include <sys/socket.h>  /* define socket */
-#include <netinet/in.h>  /* define internet socket */
-#include <netdb.h>       /* define internet socket */
-#include <stdio.h>   //deprecated
-#include <unistd.h>  //deprecated
-#include <pthread.h>
-#include <string.h> //deprecated
-#include <iostream>
-#include <cstdlib>
+#include "server.hpp"
 #include <signal.h>
+#include <utility>
 
-#define SERVER_PORT 4045        /* define a server port number */
+namespace http {
+namespace server {
 
-using namespace std;
-
-
-const int MAX_CLIENT = 50;
-
-void* thread_main(void* arg);
-void strdel(char* str);
-void sighandler(int);
-
-int FD[MAX_CLIENT];   /* allocate as many socket file descriptors 
-						as the number of clients  */
-pthread_t TD[MAX_CLIENT];   /* same for thread descriptors */
-int counter; 
-int sd;
-//mutex m;
-pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
-struct sockaddr_in server_addr = { AF_INET, htons( SERVER_PORT ) };
-struct sockaddr_in client_addr = { AF_INET };
-
-int main()
+server::server(const std::string& address, const std::string& port,
+    const std::string& doc_root)
+  : io_service_(),
+    signals_(io_service_),
+    acceptor_(io_service_),
+    connection_manager_(),
+    socket_(io_service_),
+    request_handler_(doc_root)
 {
-	int ns;
-	unsigned int client_len = sizeof( client_addr );
-	signal(SIGINT,sighandler);
-	signal(SIGTERM,sighandler);	
-	for (int i = 0; i < MAX_CLIENT; i++) FD[i] = -1; // initialize FD array
-	//socket
+  // Register to handle the signals that indicate when the server should exit.
+  // It is safe to register for the same signal multiple times in a program,
+  // provided all registration for the specified signal is made through Asio.
+  signals_.add(SIGINT);
+  signals_.add(SIGTERM);
+#if defined(SIGQUIT)
+  signals_.add(SIGQUIT);
+#endif // defined(SIGQUIT)
 
-	if( ( sd = socket( AF_INET, SOCK_STREAM, 0 ) ) == -1 )
-	{
-		perror( "server: socket failed" );
-		return 1;	
-	}
-	//cout << "socket created" << endl;
-	//bind
-	if( bind(sd, (struct sockaddr*)&server_addr, sizeof(server_addr)) == -1 )
-	{
-		perror( "server: bind failed" );
-		return 1;	
-	}
-	//cout << "bind" << endl;
-	//listen(n)   /* n is the size of the queue that holds incoming requests
-	//               from clients that want to connect  */
+  do_await_stop();
 
-	if( listen( sd, 10 ) == -1 )
-	{
-		perror( "server: listen failed" );
-		return 1;	
-	}
-	//cout << "listen" << endl;
-	cout << "server started" << endl;
-	while(( ns = accept(sd,(struct sockaddr*)&client_addr, &client_len)) > 0)
-	{  
-		bool maxClientsConnected = false;
-		counter = 0;
-		int* FDindex = new int;
-		//cout << "accepting client" << endl;
-		//lock(m);
-		pthread_mutex_lock(&m);
-		if (FD[counter] == -1 && counter != MAX_CLIENT) //FD[counter] is unused and not out of bounds
-		{
-			FD[counter] = ns;
-			*FDindex = counter++;
-			//cout << "initial FDindex = " << *FDindex << endl;
-		}
-		else
-		{
-			for (int i = 0; i < MAX_CLIENT; i++) //search for empty place in FD
-			{
-				if (FD[i] != -1) 
-				{
-					counter = i;
-					FD[counter] = ns;  
-					*FDindex = counter++;	
-					//cout << "else statement: initial FDindex = " << *FDindex << endl;
-					break;
-				}  
-			}
-			if (counter == MAX_CLIENT) //max number of clients have already connected
-			{
-				pthread_mutex_unlock(&m);		//unlock(m) early, not needed for this;
-				char* msg = new char[81];
-				strcpy(msg,"SERVER MESSAGE: Sorry, but the maximum number of clients has already connected.\n");
-				write(ns,&msg,81);
-				close(ns);
-				maxClientsConnected = true;
-				delete [] msg;
-			}
-		}
-		pthread_mutex_unlock(&m);		//unlock(m);
-		if (!maxClientsConnected)
-		{
-			//if ( pthread_create(&TD[counter], NULL, &thread_main, (void*)newsocket) != 0)
-			//	cout << "thread create error" <<endl;
-			pthread_create(&TD[counter], NULL, &thread_main, (void*)FDindex);
-		}
-	}   
-	//close stuff ...
-	close(ns);
-	close(sd);
-	unlink( (const char*)&server_addr.sin_addr);
+  // Open the acceptor with the option to reuse the address (i.e. SO_REUSEADDR).
+  boost::asio::ip::tcp::resolver resolver(io_service_);
+  boost::asio::ip::tcp::endpoint endpoint = *resolver.resolve({address, port});
+  acceptor_.open(endpoint.protocol());
+  acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+  acceptor_.bind(endpoint);
+  acceptor_.listen();
 
-	return(0);
-
+  do_accept();
 }
 
-void* thread_main(void* arg)
+void server::run()
 {
-	//cout << "client thread started" << endl;
-	//get  fd index;
-	int FDindex = *((int*)arg);
-	//cout << "FDindex = "  << FDindex << endl;
-	delete (int*)arg;
-	pthread_mutex_lock(&m);	//lock(m);
-	int thisFD = FD[FDindex];
-	//cout << "thisFD = " << thisFD << endl;
-	pthread_mutex_unlock(&m); //unlock(m);
-	const int k = 512;
-	char outtext[k];
-	char clientname[k];
-	char clienthandle[k];
-	char buf[k];
-	//read in client name;
-	int status;
-	//cin.get();
-	//cout << "about to read nickname" << endl;
-	if ( (status = read(thisFD, buf, k)) < 0)
-	{
-		perror("Reading Name Error\n");
-		exit(1);
-	}
-	//cout << "read status " << status << endl;
-	//cout << "nickname=" << buf << endl;
-	strcpy(clientname,buf);
-	//print a message about the new client;
-	const char* servermessage = "SERVER MESSAGE: ";
-	const char* hasjoined = " has joined the chat.\n";
-	strcat(strcat(strcat(outtext,servermessage),clientname),hasjoined);
-	//cout << "outtext len = " << strlen(outtext) << endl;
-	//cout << "outtext=" << endl;
-	cout << outtext << endl;
-	pthread_mutex_lock(&m);
-	for (int i = 0; i < MAX_CLIENT; i++)
-	{
-		if (FD[i] != -1) write(FD[i], outtext, k);
-		//unlock(m)          
-	}
-	pthread_mutex_unlock(&m);
-	//strdel(outtext);
-	strcat(strcpy(clienthandle,clientname),": ");
-	//cout << "starting main read loop" << endl;
-	while ((status = read(thisFD, buf, k)) > 0)
-	{
-		if (status == k)
-		{
-			//cout << "read text" << endl;
-			bool quit = strcmp(buf,"/exit") == 0 || strcmp(buf,"/quit") == 0 || strcmp(buf,"/part") == 0;
-			if (quit)
-			{
-				sprintf(outtext,"%s%s has left the chat room.\n",servermessage,clientname);
-				cout << outtext;
-				pthread_mutex_lock(&m);		//lock(m);
-				for (int i = 0; i < MAX_CLIENT; i++)
-				{
-					if (FD[i] != -1) write(FD[i], outtext, k);
-				}
-				write(thisFD,"\\c",3);
-				close(thisFD);
-				//remove myself from FDarray
-				FD[FDindex] = -1;
-				pthread_mutex_unlock(&m); 	//unlock(m) 
-				pthread_exit(NULL);
-			}
-			strcat(strcpy(outtext,clienthandle),buf);
-			//cout << "readstatus = " << status << endl;
-			cout << outtext << endl;
-			//loop
-			//write message to each FD
-			pthread_mutex_lock(&m);		//unlock(m);
-			for (int i = 0; i < MAX_CLIENT; i++)
-			{
-				if (FD[i] != -1) write(FD[i], outtext, k);
-			}
-			pthread_mutex_unlock(&m);		//unlock(m);
-			//strdel(outtext);
-		}
-	}
-	write(thisFD,"\\c",2);
-	close(thisFD);
-	//remove myself from FDarray
-	pthread_mutex_lock(&m);		//lock(m);
-	FD[FDindex] = -1;
-	pthread_mutex_unlock(&m); 	//unlock(m) 
-	//TD[count] = -1;
-	//pthread_exit(NULL);
-	return NULL;
+  // The io_service::run() call will block until all asynchronous operations
+  // have finished. While the server is running, there is always at least one
+  // asynchronous operation outstanding: the asynchronous accept call waiting
+  // for new incoming connections.
+  io_service_.run();
 }
 
-void sighandler(int sig)
+void server::do_accept()
 {
-	cout << "kill signal recieved" << endl;
-	for (int i = 10; i > 0; i--)
-	{
-		sleep(1);
-		char* outtext = new char[65];
-		sprintf(outtext,"SERVER MESSAGE: Server process will exit in %d seconds!\n",i);
-		cout << outtext;
-		pthread_mutex_lock(&m);		//lock(m);
-		for (int j = 0; j < MAX_CLIENT; j++)
-		{
-			if (FD[j] != -1) write(FD[j], outtext, 65);
-		}
-		pthread_mutex_unlock(&m);		//unlock(m);
-		delete [] outtext;
-		
-	}
-	sleep(1);
-	pthread_mutex_lock(&m);		//lock(m);
-	for (int j = 0; j < MAX_CLIENT; j++)
-	{
-		if (FD[j] != -1)
-		{
-			write(FD[j],"\\c",3);
-			close(FD[j]);
-		}
-	}
-	pthread_mutex_unlock(&m);		//unlock(m);
-	close(sd);
-	unlink( (const char*)&server_addr.sin_addr);
-	exit(0);
+  acceptor_.async_accept(socket_,
+      [this](boost::system::error_code ec)
+      {
+        // Check whether the server was stopped by a signal before this
+        // completion handler had a chance to run.
+        if (!acceptor_.is_open())
+        {
+          return;
+        }
+
+        if (!ec)
+        {
+          connection_manager_.start(std::make_shared<connection>(
+              std::move(socket_), connection_manager_, request_handler_));
+        }
+
+        do_accept();
+      });
 }
+
+void server::do_await_stop()
+{
+  signals_.async_wait(
+      [this](boost::system::error_code /*ec*/, int /*signo*/)
+      {
+        // The server is stopped by cancelling all outstanding asynchronous
+        // operations. Once all operations have finished the io_service::run()
+        // call will exit.
+        acceptor_.close();
+        connection_manager_.stop_all();
+      });
+}
+
+} // namespace server
+} // namespace http
+
